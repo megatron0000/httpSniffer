@@ -14,7 +14,18 @@
 #include <unistd.h>
 #include "packet_structs.h"
 
-static u_int32_t print_pkt(struct nfq_data *tb) {
+struct packet_verdict_t {
+  unsigned char *new_data;
+  uint32_t new_data_length;
+  u_int32_t verdict;
+  int packet_id;
+};
+
+/**
+ * `verdict` should be manipulated by the function to signal packet
+ * modifications.
+ */
+static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
   int id = 0;
   struct nfqnl_msg_packet_hdr *ph;
   struct nfqnl_msg_packet_hw *hwph;
@@ -55,23 +66,24 @@ static u_int32_t print_pkt(struct nfq_data *tb) {
 
   ret = nfq_get_payload(tb, &data);
   if (ret >= 0) {
-    uint16_t *len_and_type = ((uint16_t ***)tb)[0][NFQA_PAYLOAD - 1];
-    uint16_t len = len_and_type[0];
-    uint16_t type = len_and_type[1];
-    printf("type=");
-    for (size_t i = 0; i < 4; i++) {
-      printf("%d.", (type >> (4 - i)));
-    }
-    printf(" len=%u ", len);
-
-    printf("payload_len=%d ", ret);
+    printf("payload_len(ip+tcp+payload)=%d ", ret);
     // processPacketData (data, ret);
     struct sniff_ip *ip = (struct sniff_ip *)data;
     int ip_header_length = IP_HL(ip) * 4;
     printf("ip_header_length=%d ", ip_header_length);
+    if (ip->ip_p == IPPROTO_UDP) {
+      struct sniff_udp *udp = (sniff_udp *)(data + ip_header_length);
+      u_char *payload = data + ip_header_length + sizeof(sniff_udp);
+      printf("Payload data:\n(%.*s)\n\n", udp->len - sizeof(sniff_udp),
+             payload);
+      payload[0] = 'A';
+      udp->check = 0;
+      verdict->new_data = data;
+      verdict->new_data_length = ret;
+    }
     if (ip->ip_p != IPPROTO_TCP) {
       printf("Not a TCP packet. Skipping...\n\n");
-      return id;
+      return;
     }
     struct sniff_tcp *tcp = (sniff_tcp *)(data + ip_header_length);
     int tcp_header_length = TH_OFF(tcp) * 4;
@@ -81,20 +93,20 @@ static u_int32_t print_pkt(struct nfq_data *tb) {
     printf("Payload data:\n(%.*s)\n\n", payload_length, payload);
   }
   fputc('\n', stdout);
-
-  return id;
 }
 
 static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
               struct nfq_data *nfa, void *data) {
-  u_int32_t id = print_pkt(nfa);
-  // u_int32_t id;
+  packet_verdict_t verdict;
+  verdict.new_data = NULL;
+  verdict.new_data_length = 0;
+  verdict.verdict = NF_ACCEPT;
+  verdict.packet_id = ntohl(nfq_get_msg_packet_hdr(nfa)->packet_id);
+  print_pkt(nfa, &verdict);
 
-  struct nfqnl_msg_packet_hdr *ph;
-  ph = nfq_get_msg_packet_hdr(nfa);
-  id = ntohl(ph->packet_id);
   printf("entering callback\n");
-  return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+  return nfq_set_verdict(qh, verdict.packet_id, verdict.verdict,
+                         verdict.new_data_length, verdict.new_data);
 }
 
 int main(int argc, char **argv) {
