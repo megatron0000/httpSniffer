@@ -12,7 +12,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <map>
 #include "packet_structs.h"
+#include <string.h>
+#include <vector>
 
 struct packet_verdict_t {
   unsigned char *new_data;
@@ -20,6 +23,141 @@ struct packet_verdict_t {
   u_int32_t verdict;
   int packet_id;
 };
+
+namespace IPDefragmenter {
+
+/**
+ * Stores a packet starting from the transport header.
+ * The client of this struct is responsible for freeing the buffer
+ */
+struct Packet {
+  u_char *data;
+  int length;
+};
+
+/**
+ * Stores a packet being reconstructed. These parts contain data from the
+ * transport header onwards (i.e. transport header + payload).
+ *
+ * The client of this struct is responsible for freeing the buffer
+ */
+struct PartialPacket {
+  u_char *data;
+  int length;
+};
+
+/**
+ * Taken from
+ * https://networkengineering.stackexchange.com/questions/46514/identification-field-in-ipv4-header:
+ * "In IPv4, the Identification (ID) field is a 16-bit value that is
+ * unique for every datagram for a given source address, destination
+ * address, and protocol, such that it does not repeat within the
+ * maximum datagram lifetime (MDL) [RFC791] [RFC1122]. As currently
+ * specified, all datagrams between a source and destination of a given
+ * protocol must have unique IPv4 ID values over a period of this MDL,
+ * which is typically interpreted as two minutes and is related to the
+ * recommended reassembly timeout [RFC1122]. This uniqueness is
+ * currently specified as for all datagrams, regardless of fragmentation
+ * settings."
+ *
+ * Our convention: 128-bit key in this order: <source IP, dest IP, protocol,
+ * identification number>
+ *
+ */
+std::map<__uint128_t, std::vector<PartialPacket>> packet_fragments;
+
+__uint128_t build_map_key(sniff_ip *ip) {
+  __uint128_t key = 0;
+  key = ip->ip_src.s_addr;                // 32-bit number
+  key = (key << 32) | ip->ip_dst.s_addr;  // 32-bit number
+  key = (key << 32) | ip->ip_p;           // 8-bit number
+  key = (key << 8) | ip->ip_id;           // 16-bit number
+  return key;
+}
+
+/**
+ * Returns nullptr if the current `data` could not complete a packet (i.e. more
+ * fragments are expected).
+ *
+ * Expects `data` to contain packet data starting from IP header (including it
+ * as well).
+ *
+ * Otherwise (i.e. we have just reassembled the whole packet) returns the
+ * reassembled payload, starting from the transport header. The returned pointer
+ * should be freed by the caller.
+ */
+Packet *defrag(u_char *data, int total_length) {
+  struct sniff_ip *ip = (struct sniff_ip *)data;
+  int ip_header_length = IP_HL(ip) * 4;
+
+  // is this not-fragmented ? (easy case)
+  if (packet_fragments.count(build_map_key(ip)) == 0 &&
+      ((ip->ip_off & IP_MF) == 0)) {
+    printf("IP reassembly case 0 ¬¬'\n");
+    u_char *buffer = new u_char[total_length - ip_header_length];
+    memcpy(buffer, data + ip_header_length, total_length - ip_header_length);
+    return new Packet{data : buffer, length : total_length - ip_header_length};
+  }
+
+  // it is fragmented =( life gets harder
+
+  // case 1: we already received a fragment and are now receiving a middle
+  // fragment
+  if (packet_fragments.count(build_map_key(ip)) != 0 &&
+      ((ip->ip_off & IP_MF) != 0)) {
+    printf("IP reassembly case 1\n");
+    auto &&packet_parts = packet_fragments[build_map_key(ip)];
+    packet_parts.push_back(PartialPacket{data : data, length : total_length});
+    return nullptr;
+  }
+  // case 2: we already received a fragment and are now receiving the LAST
+  // fragment
+  else if (packet_fragments.count(build_map_key(ip)) != 0 &&
+           ((ip->ip_off & IP_MF) == 0)) {
+    printf("IP reassembly case 2\n");
+    auto &&packet_parts = packet_fragments[build_map_key(ip)];
+    packet_parts.push_back(PartialPacket{data : data, length : total_length});
+
+    int total_part_length = 0;
+    for (auto &&packet_part : packet_parts) {
+      total_part_length += packet_part.length;
+    }
+
+    Packet *packet = new Packet;
+    packet->length = total_part_length;
+    packet->data = new u_char[total_part_length];
+
+    int incremental_part_length = 0;
+    for (auto &&packet_part : packet_parts) {
+      memcpy(packet->data + incremental_part_length, packet_part.data,
+             packet_part.length);
+      delete[] packet_part.data;
+      incremental_part_length += packet_part.length;
+    }
+
+    packet_fragments.erase(build_map_key(ip));
+
+    return packet;
+
+  }
+  // case 3: we had not received a fragment before. this if the first fragment
+  else {
+    printf("IP reassembly case 3\n");
+    packet_fragments[build_map_key(ip)] = std::vector<PartialPacket>();
+    auto &&packet_parts = packet_fragments[build_map_key(ip)];
+    packet_parts.push_back(PartialPacket{data : data, length : total_length});
+    return nullptr;
+  }
+
+  printf("Reached an impossible-to-reach code\n");
+  exit(1);
+}
+
+}  // namespace IPDefragmenter
+
+namespace HTTPDefragmenter {
+void a() {}
+}  // namespace HTTPDefragmenter
 
 /**
  * `verdict` should be manipulated by the function to signal packet
@@ -71,26 +209,40 @@ static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
     struct sniff_ip *ip = (struct sniff_ip *)data;
     int ip_header_length = IP_HL(ip) * 4;
     printf("ip_header_length=%d ", ip_header_length);
-    if (ip->ip_p == IPPROTO_UDP) {
-      struct sniff_udp *udp = (sniff_udp *)(data + ip_header_length);
-      u_char *payload = data + ip_header_length + sizeof(sniff_udp);
-      printf("Payload data:\n(%.*s)\n\n", udp->len - sizeof(sniff_udp),
-             payload);
-      payload[0] = 'A';
-      udp->check = 0;
-      verdict->new_data = data;
-      verdict->new_data_length = ret;
-    }
+    // if (ip->ip_p == IPPROTO_UDP) {
+    //   struct sniff_udp *udp = (sniff_udp *)(data + ip_header_length);
+    //   u_char *payload = data + ip_header_length + sizeof(sniff_udp);
+    //   printf("Payload data:\n(%.*s)\n\n", udp->len - sizeof(sniff_udp),
+    //          payload);
+    //   payload[0] = 'A';
+    //   udp->check = 0;
+    //   verdict->new_data = data;
+    //   verdict->new_data_length = ret;
+    // }
     if (ip->ip_p != IPPROTO_TCP) {
       printf("Not a TCP packet. Skipping...\n\n");
       return;
     }
+
     struct sniff_tcp *tcp = (sniff_tcp *)(data + ip_header_length);
     int tcp_header_length = TH_OFF(tcp) * 4;
     int payload_length = ret - ip_header_length - tcp_header_length;
     printf("tcp_header_length=%d ", tcp_header_length);
     u_char *payload = data + ip_header_length + tcp_header_length;
     printf("Payload data:\n(%.*s)\n\n", payload_length, payload);
+
+    IPDefragmenter::Packet *reassemble =
+        IPDefragmenter::defrag((u_char *)ip, ret - ip_header_length);
+
+    if (reassemble != nullptr) {
+      tcp = (sniff_tcp *)reassemble->data;
+      tcp_header_length = TH_OFF(tcp) * 4;
+      payload_length = reassemble->length - tcp_header_length;
+      payload = reassemble->data + tcp_header_length;
+      printf("Just Reassembled packet:\n(%.*s)\n\n", payload_length, payload);
+      delete[] reassemble->data;
+      delete reassemble;
+    }
   }
   fputc('\n', stdout);
 }
