@@ -24,10 +24,33 @@ struct packet_verdict_t {
   int packet_id;
 };
 
+int min(int a, int b) { return a < b ? a : b; }
+
 /**
  * Returns the header length in units of byte
  */
 int get_tcp_header_length(sniff_tcp *tcp) { return TH_OFF(tcp) * 4; }
+
+/**
+ * Returns true if and only if `text` starts with `prefix`. Assumes both pointer
+ * are not-null.
+ */
+bool prefix_match(u_char *text, char *prefix) {
+  for (int i = 0;; i++) {
+    if (prefix[i] == 0) return true;
+    if (text[i] != prefix[i]) return false;
+  }
+}
+
+/**
+ * Returns true if and only if there is \r\n in the buffer
+ */
+bool has_complete_line_q(u_char *buffer, int length) {
+  for (int i = 0; i < length - 1; i++) {
+    if (buffer[i] == '\r' && buffer[i + 1] == '\n') return true;
+  }
+  return false;
+}
 
 // TODO: This does not work if fragments come out-of-order
 namespace IPDefragmenter {
@@ -168,7 +191,7 @@ namespace TCPStreamer {
 
 /**
  * Stores out-of-order bytes received through TCP but not immediately
- * consummable (because previous bytes still have not arrived).
+ * consumable (because previous bytes still have not arrived).
  *
  * Clients of this struct are responsible for freeing `data`
  */
@@ -341,161 +364,620 @@ std::pair<u_char *, bool> process_packet(sniff_tcp *tcp, sniff_ip *ip,
 
 namespace HTTPDefragmenter {
 
+enum class ParserState {
+  // nothing is known
+  INITIAL,
+  // positioned at first request line (expecting request method)
+  START_OF_REQUEST,
+  // positioned at first response line
+  START_OF_RESPONSE,
+  // may be: (1) start of header (2) empty line indicating the end of headers.
+  // Pertains either to a request or a response
+  START_OF_HEADER_LINE,
+  // will be aligned with start of body (either in a request or a response). The
+  // body may be empty, though
+  START_OF_BODY,
+  // already received some body bytes (a strictly quantity - not 0), but not all
+  MIDDLE_OF_BODY
+};
+
 /**
  * Stores information about reassembly status (received headers, received body,
  * etc.) concerning a single
  * source_ip:source_port:destination_ip:destination_port quartet and a single
  * HTTP message
+ *
+ * Clients of this struct are responsible for freeing the pointers
  */
 struct MessageReassemblyStatus {
-  /**
-   * counter for matching \r\n\r\n which characterizes the end of the HTTP
-   * headers inside an HTTP message.
-   *
-   * Thus, this counter goes from 0 to 4. When it gets to 4, this means the
-   * headers have finished
-   */
-  int how_many_terminators_matched = 0;
-  int how_many_body_bytes_received = 0;
+  ParserState state = ParserState::INITIAL;
+  bool message_header_terminated = false;
   /**
    * True if and only if the entire message body has been received (or if the
    * message has no body, in which case the body has trivially been received).
    *
-   * As in RFC2616, end of body is detected by:
-   *
-   * 4.3 Message Body
-   *
-   *    The message-body (if any) of an HTTP message is used to carry the
-   *    entity-body associated with the request or response. The message-body
-   *    differs from the entity-body only when a transfer-coding has been
-   *    applied, as indicated by the Transfer-Encoding header field (section
-   *    14.41).
-   *
-   *        message-body = entity-body
-   *                     | <entity-body encoded as per Transfer-Encoding>
-   *
-   *    Transfer-Encoding MUST be used to indicate any transfer-codings
-   *    applied by an application to ensure safe and proper transfer of the
-   *    message. Transfer-Encoding is a property of the message, not of the
-   *
-   *
-   *
-   * Fielding, et al.            Standards Track                    [Page 32]
-   *
-   * RFC 2616                        HTTP/1.1                       June 1999
-   *
-   *
-   *    entity, and thus MAY be added or removed by any application along the
-   *    request/response chain. (However, section 3.6 places restrictions on
-   *    when certain transfer-codings may be used.)
-   *
-   *    The rules for when a message-body is allowed in a message differ for
-   *    requests and responses.
-   *
-   *    The presence of a message-body in a request is signaled by the
-   *    inclusion of a Content-Length or Transfer-Encoding header field in
-   *    the request's message-headers. A message-body MUST NOT be included in
-   *    a request if the specification of the request method (section 5.1.1)
-   *    does not allow sending an entity-body in requests. A server SHOULD
-   *    read and forward a message-body on any request; if the request method
-   *    does not include defined semantics for an entity-body, then the
-   *    message-body SHOULD be ignored when handling the request.
-   *
-   *    For response messages, whether or not a message-body is included with
-   *    a message is dependent on both the request method and the response
-   *    status code (section 6.1.1). All responses to the HEAD request method
-   *    MUST NOT include a message-body, even though the presence of entity-
-   *    header fields might lead one to believe they do. All 1xx
-   *    (informational), 204 (no content), and 304 (not modified) responses
-   *    MUST NOT include a message-body. All other responses do include a
-   *    message-body, although it MAY be of zero length.
-   *
-   * 4.4 Message Length
-   *
-   *    The transfer-length of a message is the length of the message-body as
-   *    it appears in the message; that is, after any transfer-codings have
-   *    been applied. When a message-body is included with a message, the
-   *    transfer-length of that body is determined by one of the following
-   *    (in order of precedence):
-   *
-   *    1.Any response message which "MUST NOT" include a message-body (such
-   *      as the 1xx, 204, and 304 responses and any response to a HEAD
-   *      request) is always terminated by the first empty line after the
-   *      header fields, regardless of the entity-header fields present in
-   *      the message.
-   *
-   *    2.If a Transfer-Encoding header field (section 14.41) is present and
-   *      has any value other than "identity", then the transfer-length is
-   *      defined by use of the "chunked" transfer-coding (section 3.6),
-   *      unless the message is terminated by closing the connection.
-   *
-   *    3.If a Content-Length header field (section 14.13) is present, its
-   *      decimal value in OCTETs represents both the entity-length and the
-   *      transfer-length. The Content-Length header field MUST NOT be sent
-   *      if these two lengths are different (i.e., if a Transfer-Encoding
-   *
-   *
-   *
-   * Fielding, et al.            Standards Track                    [Page 33]
-   *
-   * RFC 2616                        HTTP/1.1                       June 1999
-   *
-   *
-   *      header field is present). If a message is received with both a
-   *      Transfer-Encoding header field and a Content-Length header field,
-   *      the latter MUST be ignored.
-   *
-   *    4.If the message uses the media type "multipart/byteranges", and the
-   *      ransfer-length is not otherwise specified, then this self-
-   *      elimiting media type defines the transfer-length. This media type
-   *      UST NOT be used unless the sender knows that the recipient can arse
-   *      it; the presence in a request of a Range header with ultiple byte-
-   *      range specifiers from a 1.1 client implies that the lient can parse
-   *      multipart/byteranges responses.
-   *
-   *        A range header might be forwarded by a 1.0 proxy that does not
-   *        understand multipart/byteranges; in this case the server MUST
-   *        delimit the message using methods defined in items 1,3 or 5 of
-   *        this section.
-   *
-   *    5.By the server closing the connection. (Closing the connection
-   *      cannot be used to indicate the end of a request body, since that
-   *      would leave no possibility for the server to send back a response.)
-   *
-   *    For compatibility with HTTP/1.0 applications, HTTP/1.1 requests
-   *    containing a message-body MUST include a valid Content-Length header
-   *    field unless the server is known to be HTTP/1.1 compliant. If a
-   *    request contains a message-body and a Content-Length is not given,
-   *    the server SHOULD respond with 400 (bad request) if it cannot
-   *    determine the length of the message, or with 411 (length required) if
-   *    it wishes to insist on receiving a valid Content-Length.
-   *
-   *    All HTTP/1.1 applications that receive entities MUST accept the
-   *    "chunked" transfer-coding (section 3.6), thus allowing this mechanism
-   *    to be used for messages when the message length cannot be determined
-   *    in advance.
-   *
-   *    Messages MUST NOT include both a Content-Length header field and a
-   *    non-identity transfer-coding. If the message does include a non-
-   *    identity transfer-coding, the Content-Length MUST be ignored.
-   *
-   *    When a Content-Length is given in a message where a message-body is
-   *    allowed, its field value MUST exactly match the number of OCTETs in
-   *    the message-body. HTTP/1.1 user agents MUST notify the user when an
-   *    invalid length is received and detected.
+   * See RFC2616 for how to detect end of body
    */
   bool message_body_terminated = false;
+  u_char *raw_body;
+  int raw_body_length = 0;
+  int raw_body_partial_length = 0;
   /**
-   * Bytes left unparsed since the last call to assemble was made.
-   * For example, `leftover_data` can contain the start of a message header
-   * which, for some reason, came in separate packets.
-   *
-   * As another example, `leftover_data` can contain parts of the message body
-   * while it is not completely received.
+   * All bytes composing the message
    */
-  u_char *leftover_data = nullptr;
-  int leftover_data_length = 0;
+  u_char *raw_data = nullptr;
+  int raw_data_length = 0;
+  /**
+   * Where we are currently parsing in `raw_data`
+   */
+  int raw_data_index = 0;
+
+  /**
+   * True if and only if this struct is being used to reassemble a request (as
+   * opposed to reassemble a response)
+   */
+  bool is_request;
+
+  // followings fields may not apply (for example, if this struct has
+  // `is_request`, then fields pertaining to a response will not be touched)
+
+  std::string request_method;
+  std::string request_url;
+  std::map<std::string, std::string> headers;
+  int response_status;
 };
+
+/**
+ * Stores both an HTTP request and its response. Clients of this struct are
+ * responsible for freeing the pointers
+ */
+struct HTTPReqRes {
+  std::string request_method;
+  std::string request_url;
+  std::map<std::string, std::string> request_headers;
+  std::map<std::string, std::string> response_headers;
+  int response_status;
+  u_char *request_body;
+  int request_body_length;
+  u_char *response_body;
+  int response_body_length;
+};
+
+/**
+ * By convention, the key is, in this order: <source ip, source port,
+ * destination ip, destination port>
+ */
+std::map<__uint128_t, MessageReassemblyStatus> message_status_map;
+
+/**
+ * Useful when the communicating peers pipeline requests. At the time of
+ * processing a response, more than 1 request may have already gone out and
+ * been completely parsed. As we still want those requests' data, we require
+ * this vector.
+ *
+ * The vector will contain partial HTTPReqRes structs, filled only with the
+ * request data. The response data will be filled once the response arrives and
+ * is completely parsed, which obviously happens strictly after the request goes
+ * out to the net completely
+ */
+std::map<__uint128_t, std::vector<HTTPReqRes>> pipelined_requests;
+
+__uint128_t build_map_key(sniff_tcp *tcp, sniff_ip *ip) {
+  __uint128_t key = 0;
+  key = ip->ip_src.s_addr;                               // 32-bit number
+  key = (key << 16) | ((__uint128_t)tcp->th_sport);      // 16-bit number
+  key = (key << 32) | ((__uint128_t)ip->ip_dst.s_addr);  // 32-bit number
+  key = (key << 16) | ((__uint128_t)tcp->th_dport);      // 16-bit number
+  return key;
+}
+
+__uint128_t build_peer_map_key(sniff_tcp *tcp, sniff_ip *ip) {
+  __uint128_t key = 0;
+  key = ip->ip_dst.s_addr;                               // 32-bit number
+  key = (key << 16) | ((__uint128_t)tcp->th_dport);      // 16-bit number
+  key = (key << 32) | ((__uint128_t)ip->ip_src.s_addr);  // 32-bit number
+  key = (key << 16) | ((__uint128_t)tcp->th_sport);      // 16-bit number
+  return key;
+}
+
+/**
+ * Resets everything except for `is_request`, because this characterizes the
+ * peer's role (client or server) and does not change between requests.
+ *
+ * Accomodates leftover data in buffer (which is not zero in case peers use
+ * message pipelining)
+ */
+void reset_reassembly_status(MessageReassemblyStatus &status) {
+  auto &&next_index = status.raw_data_index;
+  status.headers.clear();
+  status.raw_body_length = 0;
+  status.response_status = 0;
+  status.message_body_terminated = false;
+  status.message_header_terminated = false;
+  status.request_method.clear();
+  status.request_url.clear();
+  status.state = status.is_request ? ParserState::START_OF_REQUEST
+                                   : ParserState::START_OF_RESPONSE;
+  if (status.raw_body) delete[] status.raw_body;
+  status.raw_body_length = 0;
+  status.raw_body_partial_length = 0;
+  if (next_index == status.raw_data_length) {  // no leftover data
+    status.raw_data_length = 0;
+    delete[] status.raw_data;
+    status.raw_data_index = 0;
+  } else {  // there is some leftover data
+    int total_length = status.raw_data_length;
+    int new_length = total_length - next_index;
+    status.raw_data_length = new_length;
+    u_char *old_data = status.raw_data;
+    u_char *new_data = new u_char[new_length];
+    memcpy(new_data, old_data + next_index, new_length);
+    delete[] old_data;
+    status.raw_data = new_data;
+    status.raw_data_index = 0;
+  }
+}
+
+/**
+ * Outputs the record of the request-response exchange.
+ *
+ * Removes the associated pipelined request from `pipelined_requests`.
+ */
+HTTPReqRes *finish_response_message(sniff_ip *ip, sniff_tcp *tcp) {
+  __uint128_t map_key = build_map_key(tcp, ip);
+
+  auto &&status = message_status_map[map_key];
+  auto &&next_index = status.raw_data_index;
+
+  // recover the pipelined request and fill it with response data
+  HTTPReqRes *reqres = new HTTPReqRes;
+  HTTPReqRes front = pipelined_requests[map_key].front();
+  *reqres = front;
+  pipelined_requests[map_key].erase(pipelined_requests[map_key].begin());
+  if (status.raw_body_length != 0) {
+    reqres->response_body = new u_char[status.raw_body_length];
+    memcpy(reqres->response_body, status.raw_body, status.raw_body_length);
+    reqres->response_body_length = status.raw_body_length;
+  } else {
+    reqres->response_body = nullptr;
+    reqres->response_body_length = 0;
+  }
+  reqres->response_headers = status.headers;
+  reqres->response_status = status.response_status;
+
+  return reqres;
+}
+
+/**
+ * Can parse either a request or a response.
+ *
+ * Expects that at least 1 body byte has already been received (and stored in
+ * `raw_body`) prior to calling this function
+ */
+HTTPReqRes *process_bytes_since_body_middle(sniff_ip *ip, sniff_tcp *tcp) {
+  __uint128_t map_key = build_map_key(tcp, ip);
+
+  auto &&status = message_status_map[map_key];
+  auto &&next_index = status.raw_data_index;
+
+  int consumable_length =
+      min(status.raw_data_length - next_index,
+          status.raw_body_length - status.raw_body_partial_length);
+
+  // no further bytes yet
+  if (consumable_length == 0) {
+    return nullptr;
+  }
+
+  memcpy(status.raw_body + status.raw_body_partial_length,
+         &status.raw_data[next_index], consumable_length);
+  status.raw_body_partial_length += consumable_length;
+  next_index += consumable_length;
+
+  // maybe we finished receiving the body
+  if (status.raw_body_partial_length == status.raw_body_length) {
+    HTTPReqRes *reqres = finish_response_message(ip, tcp);
+
+    // prepare state for future responses
+    reset_reassembly_status(status);
+
+    return reqres;
+  }
+
+  // maybe not
+  return nullptr;
+}
+
+/**
+ * Can parse either a request or a response
+ */
+HTTPReqRes *process_bytes_since_body_start(sniff_ip *ip, sniff_tcp *tcp) {
+  __uint128_t map_key = build_map_key(tcp, ip);
+
+  auto &&status = message_status_map[map_key];
+  auto &&next_index = status.raw_data_index;
+
+  for (auto &&header : status.headers) {
+    printf("HTTP Header: %s: %s\n", header.first.data(), header.second.data());
+  }
+
+  int content_length = -1;
+  if (status.headers.count("Content-Length") != 0) {
+    content_length = atoi(status.headers["Content-Length"].data());
+  }
+  // TODO: As of now, we only support Content-Length header for body size
+  // calculation
+  // case 1: unsupported size-specifying header
+  if (content_length == -1 && status.headers.count("Transfer-Encoding") != 0) {
+    printf(
+        "Received Transfer-Encoding header, but we only support "
+        "Content-Length\n");
+    exit(1);
+  }
+
+  // case 2: There is no body and this is a request
+  else if (content_length == -1 && status.is_request) {
+    // store the pipelined request
+    HTTPReqRes partial;
+    if (status.raw_body_length != 0) {
+      partial.request_body = new u_char[status.raw_body_length];
+      memcpy(partial.request_body, status.raw_body, status.raw_body_length);
+      partial.request_body_length = status.raw_body_length;
+    } else {
+      partial.request_body = nullptr;
+      partial.request_body_length = 0;
+    }
+    partial.request_headers = status.headers;
+    partial.request_method = status.request_method;
+    partial.request_url = status.request_url;
+    pipelined_requests[map_key].push_back(partial);
+
+    // prepare state for future requests
+    reset_reassembly_status(status);
+
+    return nullptr;
+  }
+
+  // case 3: There is no body and this is a response
+  else if (content_length == -1 && !status.is_request) {
+    HTTPReqRes *reqres = finish_response_message(ip, tcp);
+
+    // prepare state for future responses
+    reset_reassembly_status(status);
+
+    return reqres;
+
+  }
+
+  // case 4: There IS body
+  else if (content_length != -1) {
+    int consumable_length =
+        min(status.raw_data_length - next_index, content_length);
+
+    // we are about to receive the body, but have not received the first byte
+    // yet
+    if (consumable_length == 0) {
+      return nullptr;
+    }
+
+    status.raw_body_length = content_length;
+    status.raw_body_partial_length = consumable_length;
+    status.raw_body = new u_char[content_length];
+    memcpy(status.raw_body, &status.raw_data[next_index], consumable_length);
+    next_index += consumable_length;
+
+    // maybe we received the whole body at once
+    if (consumable_length == content_length) {
+      HTTPReqRes *reqres = finish_response_message(ip, tcp);
+
+      // prepare state for future responses
+      reset_reassembly_status(status);
+
+      return reqres;
+    }
+
+    // maybe not
+    status.state = ParserState::MIDDLE_OF_BODY;
+    return nullptr;
+  }
+}
+
+/**
+ * Can parse either a request or a response
+ */
+HTTPReqRes *process_bytes_since_header_line(sniff_ip *ip, sniff_tcp *tcp) {
+  __uint128_t map_key = build_map_key(tcp, ip);
+
+  auto &&status = message_status_map[map_key];
+  auto &&next_index = status.raw_data_index;
+
+  while (true) {  // will only get out on break or return
+    status.state = ParserState::START_OF_HEADER_LINE;
+
+    // determine if we have a complete header line
+    // TODO: Simplifying assumption: folded header lines are deprecated
+    bool has_complete_line = has_complete_line_q(
+        &status.raw_data[next_index], status.raw_data_length - next_index);
+
+    // maybe we are already at header-end
+    if (has_complete_line &&
+        prefix_match(&status.raw_data[next_index], "\r\n")) {
+      next_index += 2;
+      status.state = ParserState::START_OF_BODY;
+      status.message_header_terminated = true;
+      return process_bytes_since_body_start(ip, tcp);
+    }
+
+    // save line fragment for later processing
+    if (!has_complete_line) {
+      // int rest_length = status.raw_data_length - next_index;
+      // u_char *rest = new u_char[rest_length];
+      // memcpy(rest, &status.raw_data[next_index], rest_length);
+      // delete[] status.raw_data;
+      // status.raw_data = rest;
+      // status.raw_data_length = rest_length;
+      // status.state = ParserState::START_OF_HEADER_LINE;
+      return nullptr;
+    }
+
+    // we have entire line. Consume the header and proceed to start of next
+    // line
+    while (isspace(status.raw_data[next_index])) next_index++;
+
+    // capture header name
+    std::string header_name = "";
+    while (!isspace(status.raw_data[next_index]) &&
+           status.raw_data[next_index] != ':') {
+      header_name.push_back(status.raw_data[next_index]);
+      next_index++;
+    }
+
+    next_index++;  // skip ":" separator
+
+    while (isspace(status.raw_data[next_index])) next_index++;
+
+    // capture header value
+    std::string header_value = "";
+    while (status.raw_data[next_index] != '\r') {
+      header_value.push_back(status.raw_data[next_index]);
+      next_index++;
+    }
+
+    status.headers[header_name] = header_value;
+
+    // skip \r\n
+
+    next_index++;
+    if (status.raw_data[next_index] != '\n') {
+      printf("Expected line terminator, but got '%c'",
+             status.raw_data[next_index]);
+      exit(1);
+    }
+    next_index++;
+  }
+}
+
+/**
+ * Can parse a request. CANNOT parse a response
+ */
+HTTPReqRes *process_bytes_since_request_line(sniff_ip *ip, sniff_tcp *tcp) {
+  __uint128_t map_key = build_map_key(tcp, ip);
+
+  auto &&status = message_status_map[map_key];
+  auto &&next_index = status.raw_data_index;
+
+  // determine if we have a complete request line
+  bool has_complete_line =
+      has_complete_line_q(&status.raw_data[status.raw_data_index],
+                          status.raw_data_length - next_index);
+
+  if (!has_complete_line) {
+    return nullptr;
+  }
+
+  if (status.raw_data_length - next_index >= 7 &&
+      prefix_match(&status.raw_data[next_index], "OPTIONS")) {
+    next_index += 7;  // right after OPTIONS
+    status.request_method = "OPTIONS";
+  } else if (status.raw_data_length - next_index >= 3 &&
+             prefix_match(&status.raw_data[next_index], "GET")) {
+    next_index += 3;  // right after GET
+    status.request_method = "GET";
+  } else if (status.raw_data_length - next_index >= 4 &&
+             prefix_match(&status.raw_data[next_index], "HEAD")) {
+    next_index += 4;  // right after HEAD
+    status.request_method = "HEAD";
+  } else if (status.raw_data_length - next_index >= 4 &&
+             prefix_match(&status.raw_data[next_index], "POST")) {
+    next_index += 4;  // right after POST
+    status.request_method = "POST";
+  } else if (status.raw_data_length - next_index >= 3 &&
+             prefix_match(&status.raw_data[next_index], "PUT")) {
+    next_index += 3;  // right after PUT
+    status.request_method = "PUT";
+  } else if (status.raw_data_length - next_index >= 6 &&
+             prefix_match(&status.raw_data[next_index], "DELETE")) {
+    next_index += 6;  // right after DELETE
+    status.request_method = "DELETE";
+  } else {
+    printf("HTTP method not supported.\n");
+    return nullptr;
+  }
+
+  // skip white space
+  while (isspace(status.raw_data[next_index])) next_index++;
+
+  // now comes the request URI
+  status.request_url = "";
+  while (!isspace(status.raw_data[next_index])) {
+    status.request_url.push_back(status.raw_data[next_index]);
+    next_index++;
+  }
+
+  // finally the HTTP version. Does not matter to us
+  while (!prefix_match(&status.raw_data[next_index], "\r\n")) {
+    next_index++;
+  }
+
+  next_index += 2;  // skip \r\n
+
+  // now we are at the start of the first header line.
+  return process_bytes_since_header_line(ip, tcp);
+}
+
+/**
+ * Can parse a response. CANNOT parse a request
+ */
+HTTPReqRes *process_bytes_since_status_line(sniff_ip *ip, sniff_tcp *tcp) {
+  __uint128_t map_key = build_map_key(tcp, ip);
+
+  auto &&status = message_status_map[map_key];
+  auto &&next_index = status.raw_data_index;
+
+  // determine if we have a complete request line
+  bool has_complete_line =
+      has_complete_line_q(&status.raw_data[status.raw_data_index],
+                          status.raw_data_length - next_index);
+
+  if (!has_complete_line) {
+    return nullptr;
+  }
+
+  // skip HTTP version
+  while (!isspace(status.raw_data[next_index])) next_index++;
+
+  // skip whitespace
+  while (isspace(status.raw_data[next_index])) next_index++;
+
+  // capture status code
+  status.response_status = 0;
+  while (!isspace(status.raw_data[next_index])) {
+    status.response_status =
+        status.response_status * 10 + (status.raw_data[next_index] - '0');
+    next_index++;
+  }
+
+  // skip whitespace
+  while (isspace(status.raw_data[next_index])) next_index++;
+
+  // skip status phrase
+  while (status.raw_data[next_index] != '\r') next_index++;
+
+  // skip \r\n at end of line
+  next_index += 2;
+
+  return process_bytes_since_header_line(ip, tcp);
+}
+
+/**
+ * Expects to receive TCP payload already deduplicated.
+ *
+ * Returns nullptr if the request-response cycle has not completed yet.
+ * Otherwise, returns the contents of the HTTP exchange. Clients of this
+ * function are responsible for freeing the returned pointer.
+ *
+ * `data` is expected to contain purely TCP payload (no headers)
+ */
+HTTPReqRes *process_bytes(sniff_ip *ip, sniff_tcp *tcp, u_char *data,
+                          u_int length) {
+  __uint128_t map_key = build_map_key(tcp, ip);
+
+  // if we have no record of this exchange, try to interpret it as the
+  // beginning of an HTTP request or response
+  if (message_status_map.count(map_key) == 0) {
+    // peer also has no record (or explicitly states it is parsing a
+    // response). Therefore this is a request
+    if (message_status_map.count(build_peer_map_key(tcp, ip)) == 0 ||
+        message_status_map[build_peer_map_key(tcp, ip)].is_request == false) {
+      MessageReassemblyStatus status{
+        state : ParserState::START_OF_REQUEST,
+        message_header_terminated : false,
+        message_body_terminated : false,
+        raw_body : nullptr,
+        raw_body_length : 0,
+        raw_body_partial_length : 0,
+        raw_data : nullptr,
+        raw_data_length : (int)length,
+        raw_data_index : 0,
+        is_request : true
+      };
+      status.raw_data = new u_char[length];
+      memcpy(status.raw_data, data, length);
+      message_status_map[map_key] = status;
+
+      return process_bytes_since_request_line(ip, tcp);
+    }
+    // else, this is a response
+    else {
+      MessageReassemblyStatus status{
+        state : ParserState::START_OF_REQUEST,
+        message_header_terminated : false,
+        message_body_terminated : false,
+        raw_body : nullptr,
+        raw_body_length : 0,
+        raw_body_partial_length : 0,
+        raw_data : nullptr,
+        raw_data_length : (int)length,
+        raw_data_index : 0,
+        is_request : false
+      };
+      status.raw_data = new u_char[length];
+      memcpy(status.raw_data, data, length);
+      message_status_map[map_key] = status;
+
+      return process_bytes_since_status_line(ip, tcp);
+    }
+  }
+  // we have a record of this exchange. Either parse it as a request or as a
+  // response
+  else {
+    auto &&status = message_status_map[map_key];
+
+    // append data to `raw_data` pointer
+    if (status.raw_data_length == 0) {
+      status.raw_data = new u_char[length];
+      memcpy(status.raw_data, data, length);
+      status.raw_data_length = length;
+    } else {
+      u_char *raw_data_old = status.raw_data;
+      int old_length = status.raw_data_length;
+      u_char *raw_data_new = new u_char[old_length + length];
+      memcpy(raw_data_new, raw_data_old, old_length);
+      memcpy(raw_data_new + old_length, data, length);
+      delete[] raw_data_old;
+      status.raw_data_length = old_length + length;
+    }
+
+    // Dispatch to the correct handler. It will disambiguate between
+    // request/response by itself as needed
+    switch (status.state) {
+      case ParserState::START_OF_REQUEST:
+        return process_bytes_since_request_line(ip, tcp);
+        break;
+
+      case ParserState::START_OF_HEADER_LINE:
+        return process_bytes_since_header_line(ip, tcp);
+        break;
+
+      case ParserState::START_OF_BODY:
+        return process_bytes_since_body_start(ip, tcp);
+        break;
+
+      case ParserState::MIDDLE_OF_BODY:
+        return process_bytes_since_body_middle(ip, tcp);
+        break;
+
+      case ParserState::START_OF_RESPONSE:
+        return process_bytes_since_status_line(ip, tcp);
+        break;
+
+      default:
+        printf("There is no default\n");
+        exit(1);
+        break;
+    }
+  }
+}
 
 }  // namespace HTTPDefragmenter
 
@@ -592,6 +1074,18 @@ static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
       if (tcp_dedup.first) {
         printf("Reassembled TCP payload:\n(%.*s)\n\n", payload_length,
                tcp_dedup.first);
+
+        HTTPDefragmenter::HTTPReqRes *http_msg =
+            HTTPDefragmenter::process_bytes(ip, tcp, tcp_dedup.first,
+                                            payload_length);
+
+        if (http_msg) {
+          printf("Reassembled HTTP req-res cycle.\n");
+          delete[] http_msg->request_body;
+          delete[] http_msg->response_body;
+          delete http_msg;
+        }
+
         delete[] tcp_dedup.first;
       }
       delete[] reassemble->data;
