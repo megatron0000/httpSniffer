@@ -9,3 +9,9 @@ The changes to `iptables` can be undone via `bash remove-rule.sh`. This is so th
 # Execution
 
 As of the time of writing, running `nfqueue.out` will print information about all packets both arriving and exiting the machine.
+
+# Developing
+
+TODO items are marked "TODO" in the source code.
+
+Take care with `ntohl` and `ntohs`, which must be called on packet data so as to rearrange the byte order
