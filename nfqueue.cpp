@@ -16,6 +16,7 @@
 #include "packet_structs.h"
 #include <string.h>
 #include <vector>
+#include <chrono>
 
 struct packet_verdict_t {
   unsigned char *new_data;
@@ -262,9 +263,11 @@ __uint128_t build_peer_map_key(sniff_tcp *tcp, sniff_ip *ip) {
  */
 std::pair<u_char *, bool> process_packet(sniff_tcp *tcp, sniff_ip *ip,
                                          int transport_length) {
+  printf("TCP process packet\n");
   // beginning of connection
   if ((tcp->th_flags & TH_SYN) &&
       flow_status_map.count(build_map_key(tcp, ip)) == 0) {
+    printf("Beggining of connection\n");
     flow_status_map[build_map_key(tcp, ip)] = TCPFlowStatus{
       initial_seqnum : ntohl(tcp->th_seq) + 1,
       received_bytes_count : 0,
@@ -283,20 +286,24 @@ std::pair<u_char *, bool> process_packet(sniff_tcp *tcp, sniff_ip *ip,
 
   // end of connection
   if (tcp->th_flags & TH_FIN) {
+    printf("End of connection (FIN)\n");
     status.terminated = true;
     auto &&peer_status = flow_status_map[build_peer_map_key(tcp, ip)];
     if (peer_status.terminated) {
       flow_status_map.erase(build_map_key(tcp, ip));
       flow_status_map.erase(build_peer_map_key(tcp, ip));
       return {nullptr, true};
-    } else {
-      return {nullptr, false};
     }
+    // do nothing otherwise since we may still have payload
   }
 
   // mid-connection
   u_int next_seq_num = status.initial_seqnum + status.received_bytes_count;
   if (ntohl(tcp->th_seq) < next_seq_num) {
+    printf(
+        "TCP already had this payload (retransmission), since received %u and "
+        "expected sequence number was %u\n",
+        ntohl(tcp->th_seq), next_seq_num);
     return {nullptr, false};  // because this is a retransmission (we already
                               // had this payload)
   }
@@ -323,9 +330,11 @@ std::pair<u_char *, bool> process_packet(sniff_tcp *tcp, sniff_ip *ip,
   // bytes arrived in-order
 
   // accumulate previous out-of-order bytes
+  printf("TCP detected in-order bytes\n");
   u_int tcp_header_length = get_tcp_header_length(tcp);
   u_int payload_length = transport_length - tcp_header_length;
   if (payload_length == 0) {
+    printf("Expected some TCP payload\n");
     return {nullptr, false};
   }
   u_int accum_payload_length = payload_length;
@@ -462,6 +471,8 @@ std::map<__uint128_t, MessageReassemblyStatus> message_status_map;
  */
 std::map<__uint128_t, std::vector<HTTPReqRes>> pipelined_requests;
 
+FILE *log = fopen("log.txt", "w+");
+
 __uint128_t build_map_key(sniff_tcp *tcp, sniff_ip *ip) {
   __uint128_t key = 0;
   key = ip->ip_src.s_addr;                               // 32-bit number
@@ -524,16 +535,23 @@ void reset_reassembly_status(MessageReassemblyStatus &status) {
  * Removes the associated pipelined request from `pipelined_requests`.
  */
 HTTPReqRes *finish_response_message(sniff_ip *ip, sniff_tcp *tcp) {
+  printf("finish_response_message\n");
   __uint128_t map_key = build_map_key(tcp, ip);
+  __uint128_t peer_map_key = build_peer_map_key(tcp, ip);
 
   auto &&status = message_status_map[map_key];
   auto &&next_index = status.raw_data_index;
 
   // recover the pipelined request and fill it with response data
   HTTPReqRes *reqres = new HTTPReqRes;
-  HTTPReqRes front = pipelined_requests[map_key].front();
+  if (pipelined_requests.count(peer_map_key) == 0) {
+    printf("should have a request in memory\n");
+    exit(1);
+  }
+  HTTPReqRes front = pipelined_requests[peer_map_key].front();
   *reqres = front;
-  pipelined_requests[map_key].erase(pipelined_requests[map_key].begin());
+  pipelined_requests[peer_map_key].erase(
+      pipelined_requests[peer_map_key].begin());
   if (status.raw_body_length != 0) {
     reqres->response_body = new u_char[status.raw_body_length];
     memcpy(reqres->response_body, status.raw_body, status.raw_body_length);
@@ -549,12 +567,42 @@ HTTPReqRes *finish_response_message(sniff_ip *ip, sniff_tcp *tcp) {
 }
 
 /**
+ * Does nothing more than enqueue the request in the pipelining history
+ */
+void finish_request_message(sniff_ip *ip, sniff_tcp *tcp) {
+  printf("finish_response_message\n");
+  __uint128_t map_key = build_map_key(tcp, ip);
+
+  auto &&status = message_status_map[map_key];
+  auto &&next_index = status.raw_data_index;
+
+  // store the pipelined request
+  HTTPReqRes partial;
+  if (status.raw_body_length != 0) {
+    partial.request_body = new u_char[status.raw_body_length];
+    memcpy(partial.request_body, status.raw_body, status.raw_body_length);
+    partial.request_body_length = status.raw_body_length;
+  } else {
+    partial.request_body = nullptr;
+    partial.request_body_length = 0;
+  }
+  partial.request_headers = status.headers;
+  partial.request_method = status.request_method;
+  partial.request_url = status.request_url;
+  if (pipelined_requests.count(map_key) == 0) {
+    pipelined_requests[map_key] = std::vector<HTTPReqRes>();
+  }
+  pipelined_requests[map_key].push_back(partial);
+}
+
+/**
  * Can parse either a request or a response.
  *
  * Expects that at least 1 body byte has already been received (and stored in
  * `raw_body`) prior to calling this function
  */
 HTTPReqRes *process_bytes_since_body_middle(sniff_ip *ip, sniff_tcp *tcp) {
+  printf("process_bytes_since_body_middle\n");
   __uint128_t map_key = build_map_key(tcp, ip);
 
   auto &&status = message_status_map[map_key];
@@ -566,6 +614,7 @@ HTTPReqRes *process_bytes_since_body_middle(sniff_ip *ip, sniff_tcp *tcp) {
 
   // no further bytes yet
   if (consumable_length == 0) {
+    printf("no consumable length in middle of body\n");
     return nullptr;
   }
 
@@ -574,11 +623,19 @@ HTTPReqRes *process_bytes_since_body_middle(sniff_ip *ip, sniff_tcp *tcp) {
   status.raw_body_partial_length += consumable_length;
   next_index += consumable_length;
 
-  // maybe we finished receiving the body
+  // maybe we finished receiving the body (either of a request or a response)
   if (status.raw_body_partial_length == status.raw_body_length) {
-    HTTPReqRes *reqres = finish_response_message(ip, tcp);
+    HTTPReqRes *reqres = nullptr;
 
-    // prepare state for future responses
+    if (status.is_request) {
+      printf("finishing request message\n");
+      finish_request_message(ip, tcp);
+    } else {
+      printf("finishing response message\n");
+      reqres = finish_response_message(ip, tcp);
+    }
+
+    // prepare state for future requests/responses
     reset_reassembly_status(status);
 
     return reqres;
@@ -592,14 +649,11 @@ HTTPReqRes *process_bytes_since_body_middle(sniff_ip *ip, sniff_tcp *tcp) {
  * Can parse either a request or a response
  */
 HTTPReqRes *process_bytes_since_body_start(sniff_ip *ip, sniff_tcp *tcp) {
+  printf("process_bytes_since_body_start\n");
   __uint128_t map_key = build_map_key(tcp, ip);
 
   auto &&status = message_status_map[map_key];
   auto &&next_index = status.raw_data_index;
-
-  for (auto &&header : status.headers) {
-    printf("HTTP Header: %s: %s\n", header.first.data(), header.second.data());
-  }
 
   int content_length = -1;
   if (status.headers.count("Content-Length") != 0) {
@@ -617,20 +671,7 @@ HTTPReqRes *process_bytes_since_body_start(sniff_ip *ip, sniff_tcp *tcp) {
 
   // case 2: There is no body and this is a request
   else if (content_length == -1 && status.is_request) {
-    // store the pipelined request
-    HTTPReqRes partial;
-    if (status.raw_body_length != 0) {
-      partial.request_body = new u_char[status.raw_body_length];
-      memcpy(partial.request_body, status.raw_body, status.raw_body_length);
-      partial.request_body_length = status.raw_body_length;
-    } else {
-      partial.request_body = nullptr;
-      partial.request_body_length = 0;
-    }
-    partial.request_headers = status.headers;
-    partial.request_method = status.request_method;
-    partial.request_url = status.request_url;
-    pipelined_requests[map_key].push_back(partial);
+    finish_request_message(ip, tcp);
 
     // prepare state for future requests
     reset_reassembly_status(status);
@@ -649,7 +690,7 @@ HTTPReqRes *process_bytes_since_body_start(sniff_ip *ip, sniff_tcp *tcp) {
 
   }
 
-  // case 4: There IS body
+  // case 4: There IS body (either in a request or in a response)
   else if (content_length != -1) {
     int consumable_length =
         min(status.raw_data_length - next_index, content_length);
@@ -666,9 +707,16 @@ HTTPReqRes *process_bytes_since_body_start(sniff_ip *ip, sniff_tcp *tcp) {
     memcpy(status.raw_body, &status.raw_data[next_index], consumable_length);
     next_index += consumable_length;
 
-    // maybe we received the whole body at once
+    // maybe we received the whole body at once (either of a request or of a
+    // response)
     if (consumable_length == content_length) {
-      HTTPReqRes *reqres = finish_response_message(ip, tcp);
+      HTTPReqRes *reqres = nullptr;
+
+      if (status.is_request) {
+        finish_request_message(ip, tcp);
+      } else {
+        reqres = finish_response_message(ip, tcp);
+      }
 
       // prepare state for future responses
       reset_reassembly_status(status);
@@ -686,6 +734,7 @@ HTTPReqRes *process_bytes_since_body_start(sniff_ip *ip, sniff_tcp *tcp) {
  * Can parse either a request or a response
  */
 HTTPReqRes *process_bytes_since_header_line(sniff_ip *ip, sniff_tcp *tcp) {
+  printf("process_bytes_since_header_line\n");
   __uint128_t map_key = build_map_key(tcp, ip);
 
   auto &&status = message_status_map[map_key];
@@ -761,6 +810,7 @@ HTTPReqRes *process_bytes_since_header_line(sniff_ip *ip, sniff_tcp *tcp) {
  * Can parse a request. CANNOT parse a response
  */
 HTTPReqRes *process_bytes_since_request_line(sniff_ip *ip, sniff_tcp *tcp) {
+  printf("process_bytes_since_request_line\n");
   __uint128_t map_key = build_map_key(tcp, ip);
 
   auto &&status = message_status_map[map_key];
@@ -829,6 +879,7 @@ HTTPReqRes *process_bytes_since_request_line(sniff_ip *ip, sniff_tcp *tcp) {
  * Can parse a response. CANNOT parse a request
  */
 HTTPReqRes *process_bytes_since_status_line(sniff_ip *ip, sniff_tcp *tcp) {
+  printf("process_bytes_since_status_line\n");
   __uint128_t map_key = build_map_key(tcp, ip);
 
   auto &&status = message_status_map[map_key];
@@ -946,6 +997,7 @@ HTTPReqRes *process_bytes(sniff_ip *ip, sniff_tcp *tcp, u_char *data,
       memcpy(raw_data_new + old_length, data, length);
       delete[] raw_data_old;
       status.raw_data_length = old_length + length;
+      status.raw_data = raw_data_new;
     }
 
     // Dispatch to the correct handler. It will disambiguate between
@@ -1066,8 +1118,8 @@ static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
       payload = reassemble->data + tcp_header_length;
       printf("Just IP-Reassembled packet:\n(%.*s)\n\n", payload_length,
              payload);
-      std::pair<u_char *, bool> tcp_dedup =
-          TCPStreamer::process_packet(tcp, ip, reassemble->length);
+      std::pair<u_char *, bool> tcp_dedup = TCPStreamer::process_packet(
+          (sniff_tcp *)reassemble->data, ip, reassemble->length);
       if (tcp_dedup.second) {
         printf("Reassembled has TCP ended\n");
       }
@@ -1081,6 +1133,61 @@ static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
 
         if (http_msg) {
           printf("Reassembled HTTP req-res cycle.\n");
+          fprintf(HTTPDefragmenter::log, "HTTP %s Request to %s\n",
+                  http_msg->request_method.data(),
+                  http_msg->request_url.data());
+          fprintf(HTTPDefragmenter::log, "Request headers:\n");
+
+          for (auto &&header : http_msg->request_headers) {
+            fprintf(HTTPDefragmenter::log, "%s: %s\n", header.first.data(),
+                    header.second.data());
+          }
+
+          fprintf(HTTPDefragmenter::log, "\n");
+
+          fprintf(HTTPDefragmenter::log, "Request body:\n");
+
+          fprintf(HTTPDefragmenter::log, "%.*s\n\n",
+                  http_msg->request_body_length, http_msg->request_body);
+
+          fprintf(HTTPDefragmenter::log, "HTTP Response\n");
+          fprintf(HTTPDefragmenter::log, "Response status: %d\n",
+                  http_msg->response_status);
+          fprintf(HTTPDefragmenter::log, "Response headers:\n");
+
+          for (auto &&header : http_msg->response_headers) {
+            fprintf(HTTPDefragmenter::log, "%s: %s\n", header.first.data(),
+                    header.second.data());
+          }
+
+          fprintf(HTTPDefragmenter::log, "\n");
+
+          bool is_png =
+              http_msg->response_headers["Content-Type"] == "image/png";
+          bool is_jpeg =
+              http_msg->response_headers["Content-Type"] == "image/jpeg";
+          bool is_image = is_png || is_jpeg;
+          if (is_image) {
+            auto filename = "data/" +
+                            std::to_string(std::chrono::system_clock::now()
+                                               .time_since_epoch()
+                                               .count()) +
+                            (is_png ? ".png" : ".jpeg");
+            auto file = fopen(filename.data(), "wb");
+            for (int i = 0; i < http_msg->response_body_length; i++) {
+              fprintf(file, "%c", http_msg->response_body[i]);
+            }
+
+            fclose(file);
+          }
+
+          fprintf(HTTPDefragmenter::log, "Response body:\n");
+
+          fprintf(HTTPDefragmenter::log, "%.*s\n\n",
+                  http_msg->response_body_length, http_msg->response_body);
+
+          fflush(HTTPDefragmenter::log);
+
           delete[] http_msg->request_body;
           delete[] http_msg->response_body;
           delete http_msg;
