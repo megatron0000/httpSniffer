@@ -1180,7 +1180,7 @@ static void print_pkt(struct nfq_data *tb, packet_verdict_t *verdict) {
               http_msg->response_headers["Content-Type"] == "image/jpeg";
           bool is_image = is_png || is_jpeg;
           if (is_image) {
-            auto filename = "data/images/" + http_msg->request_url + "/" +
+            auto filename = "data/images/" +
                             std::to_string(std::chrono::system_clock::now()
                                                .time_since_epoch()
                                                .count()) +

@@ -8,7 +8,9 @@ The changes to `iptables` can be undone via `bash remove-rule.sh`. This is so th
 
 # Execution
 
-As of the time of writing, running `nfqueue.out` will print information about all packets both arriving and exiting the machine.
+Run `bash compile.sh`. Make sure you have executed `bash insert-rule.sh`. 
+
+Run the code via `bash run.sh`, which will redirect the output to a file inside `data/logs` directory. `data/reqres` will contain request-response cycles (req/res headers, response body, etc.). `data/images` will contain image files captured directly from network packets.
 
 # Developing
 
